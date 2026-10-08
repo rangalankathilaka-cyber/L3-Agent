@@ -293,6 +293,13 @@ t2=setTimeout(function(){pageLoad.hide()},25000)})();</script>
     </div>
   </div>
   <div class="card" style="margin-top:16px">
+    <h2 style="font-size:16px;margin:0 0 6px">Domain knowledge</h2>
+    <p style="color:var(--mut);margin-top:0">Import your own PDFs (architecture, runbooks, error codes, support guides; any layout, plain .txt works too). They are read in this browser, stored in IndexedDB, and searched when you analyze a ticket and in chat. Matching excerpts are shown in Analyze and also sent, with numbers/emails/IPs masked, to the LLM when you click Ask.</p>
+    <input type="file" id="kbfile" accept=".pdf,.txt,.md" multiple aria-label="Import domain knowledge files">
+    <div id="kbmsg" role="status" aria-live="polite" style="margin-top:8px"></div><div id="kblist"></div>
+    <div class="bar"><button class="b s" id="kbclr" type="button">Remove all documents</button></div>
+  </div>
+  <div class="card" style="margin-top:16px">
     <h2 style="font-size:16px;margin:0 0 6px">Maintenance</h2>
     <p style="color:var(--mut);margin-top:0">After you change the parser rules in the code, rebuild the index so stored tickets are parsed again with the new rules.</p>
     <div class="bar" style="margin-top:0"><button class="b s" id="reb">Rebuild index</button><button class="b s" id="wipe">Delete all data</button></div>
@@ -318,8 +325,8 @@ const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
 /* ---------- Storage (IndexedDB, memory fallback) ---------- */
-let db=null,dbErr="";const mem={history:new Map(),reviews:new Map(),model:new Map()};
-const STORES=["history","reviews","model"];
+let db=null,dbErr="";const mem={history:new Map(),reviews:new Map(),model:new Map(),kb:new Map()};
+const STORES=["history","reviews","model","kb"];
 function openDb(){
   const tryOpen=(ver)=>new Promise(ok=>{try{const r=ver?indexedDB.open("ticketAgent",ver):indexedDB.open("ticketAgent");
     r.onupgradeneeded=()=>STORES.forEach(n=>{if(!r.result.objectStoreNames.contains(n))r.result.createObjectStore(n,{keyPath:"key"})});
@@ -327,7 +334,7 @@ function openDb(){
     r.onerror=()=>{dbErr=r.error?r.error.name+": "+r.error.message:"open failed";ok(null)};
     r.onblocked=()=>{dbErr="Blocked by another open tab of this page. Close other tabs and reload";ok(null)}}catch(e){dbErr=e.name+": "+e.message;ok(null)}});
   const to=p=>Promise.race([p,new Promise(ok=>setTimeout(()=>{dbErr="IndexedDB did not respond (blocked or disabled in this browser/window)";ok(null)},3000))]);
-  return (async()=>{let d=await to(tryOpen(2));if(!d&&/Version/i.test(dbErr))d=await tryOpen();if(d){db=d;dbErr=""}return !!d})();
+  return (async()=>{let d=await to(tryOpen(3));if(!d&&/Version/i.test(dbErr))d=await tryOpen();if(d){db=d;dbErr=""}return !!d})();
 }
 let dbFailAt=0,lsOk=false;
 const LSK=s=>"tia_mem_"+s;
@@ -766,23 +773,84 @@ async function geminiCall({system,msgs,maxTokens=1200,json=false,sig}){
   return txt;
 }
 const maskPII=s=>String(s||"").replace(/[\w.+-]+@[\w-]+\.[\w.]+/g,"<EMAIL>").replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g,"<IP>").replace(/\+?\b\d{9,15}\b/g,"<NUMBER>");
+/* ---------- Domain knowledge base (PDF/TXT -> chunks in IndexedDB store "kb" -> BM25 search) ---------- */
+const kbTok=s=>{const o=[];String(s||"").replace(/[A-Za-z][A-Za-z0-9_]*|\d{2,}/g,w=>{o.push(w.toLowerCase());const p=w.replace(/([a-z])([A-Z])/g,"$1 $2").split(/[_\s]+/).map(x=>x.toLowerCase()).filter(x=>x.length>2);if(p.length>1)o.push(...p)});return o.filter(w=>w.length>2&&!STOP.has(w))};
+/* Layout-agnostic: lines in -> chunks out. A short line without a full stop that looks like a title or ends with ":" starts a new section. */
+function kbChunk(lines,starts){
+  const out=[];let head="",buf=[],len=0,pg=1,pi=0,bpg=1;
+  const flush=()=>{const t=buf.join("\n").trim();if(t.length>=40)out.push({head,page:bpg,text:t.slice(0,1400)});buf=[];len=0};
+  const isHead=l=>l.length>=3&&l.length<=70&&!/[.,;]$/.test(l)&&(/:$/.test(l)||/^(\d+(\.\d+)*[.)]?\s+\S|[IVX]+\.\s)/.test(l)||(l===l.toUpperCase()&&/[A-Z]{3}/.test(l))||(/^[A-Z]/.test(l)&&l.split(/\s+/).length<=7&&l.split(/\s+/).every(w=>/^[A-Z0-9(]/.test(w)||w.length<=3)));
+  lines.forEach((raw,i)=>{const l=String(raw).replace(/\s+/g," ").trim();if(!l)return;
+    while(starts&&pi+1<starts.length&&starts[pi+1]<=i)pi++;pg=pi+1;
+    if(isHead(l)){flush();head=l.replace(/:$/,"");bpg=pg;return}
+    if(!buf.length)bpg=pg;buf.push(l);len+=l.length;if(len>=800)flush()});
+  flush();return out;
+}
+let kbIdx=null;
+async function kbLoad(force){
+  if(kbIdx&&!force)return kbIdx;
+  const c=(await dAll("kb")).map(x=>{const tf=new Map(),t=kbTok(x.head+" "+x.text);t.forEach(w=>tf.set(w,(tf.get(w)||0)+1));return {x,tf,len:t.length||1}});
+  const df=new Map();let tl=0;c.forEach(r=>{tl+=r.len;r.tf.forEach((_,w)=>df.set(w,(df.get(w)||0)+1))});
+  return kbIdx={c,df,avg:tl/Math.max(1,c.length)};
+}
+async function kbSearch(q,n){
+  const ix=await kbLoad();if(!ix.c.length)return[];
+  const qt=[...new Set(kbTok(q))],N=ix.c.length;
+  const sc=ix.c.map(r=>{let s=0,m=0;qt.forEach(w=>{const f=r.tf.get(w);if(!f)return;m++;const d=ix.df.get(w);s+=Math.log(1+(N-d+.5)/(d+.5))*f*2.2/(f+1.2*(.25+.75*r.len/ix.avg))});return {r,s,m}})
+    .filter(z=>z.m>=2&&z.s>=4).sort((a,b)=>b.s-a.s);
+  if(!sc.length)return[];
+  return sc.filter(z=>z.s>=sc[0].s*.5).slice(0,n||3).map(z=>({doc:z.r.x.doc,page:z.r.x.page,head:z.r.x.head,text:z.r.x.text,score:z.s}));
+}
+const kbQuery=(a,t)=>{const p=(a&&a.parsed)||{};return [t.summary,String(t.description||"").slice(0,1500)].concat(p.error||[],p.operation||[],p.service||[]).join(" ")};
+async function kbImport(file,onStep){
+  let lines,starts=null;
+  if(/\.pdf$/i.test(file.name)){const r=await readPdf(file,onStep);lines=r.lines;starts=r.starts}
+  else lines=(await file.text()).split(/\r?\n/);
+  const ch=kbChunk(lines,starts);if(!ch.length)throw new Error("No readable text found in "+file.name);
+  await kbRemove(file.name,true);
+  for(let i=0;i<ch.length;i++)await dPut("kb",{key:file.name+"#"+i,doc:file.name,added:Date.now(),...ch[i]});
+  kbIdx=null;return ch.length;
+}
+async function kbRemove(doc,quiet){for(const x of await dAll("kb"))if(x.doc===doc)await dDel("kb",x.key);if(!quiet)kbIdx=null}
+async function kbShow(a,t){
+  const el=$("kbres");if(!el)return;a.kb=[];
+  try{a.kb=await kbSearch(kbQuery(a,t),3)}catch(e){a.kb=[]}
+  if(!el.isConnected||!a.kb.length)return;
+  el.innerHTML=`<h3>From your domain documents</h3>`+a.kb.map(h=>`<div class="note"><b>${esc(h.doc)} · page ${h.page}</b>${h.head?" · "+esc(h.head):""}<div style="white-space:pre-wrap;margin-top:6px">${esc(h.text)}</div></div>`).join("")+`<div class="note" style="margin-top:6px">Shown as written in your PDF. Verify before acting.</div>`;
+}
+async function kbList(){
+  const el=$("kblist");if(!el)return;const g=new Map();
+  (await dAll("kb")).forEach(x=>g.set(x.doc,(g.get(x.doc)||0)+1));
+  el.innerHTML=g.size?`<ul style="margin:8px 0">${[...g].map(([d,n])=>`<li>${esc(d)} · ${n} sections <button type="button" class="b s" data-kbdel="${esc(d)}" aria-label="Remove ${esc(d)}">Remove</button></li>`).join("")}</ul>`:`<p class="note">No domain documents yet.</p>`;
+  el.querySelectorAll("[data-kbdel]").forEach(b=>b.onclick=async()=>{await kbRemove(b.dataset.kbdel);kbList()});
+}
+function kbWire(){
+  const f=$("kbfile");if(!f)return;kbList();
+  const msg=(k,h)=>{$("kbmsg").innerHTML=`<div class="note ${k}">${h}</div>`};
+  f.onchange=async()=>{const fs=[...f.files];f.value="";let ok=0;
+    for(const file of fs){try{const n=await kbImport(file,s=>msg("",esc(file.name)+": "+esc(s)));ok++;msg("",`Imported ${esc(file.name)} (${n} sections).`)}catch(e){msg("err",esc(file.name)+": "+esc(e.message))}}
+    await kbList();if(ok>1)msg("",`Imported ${ok} documents.`)};
+  $("kbclr").onclick=async()=>{if(!confirm("Remove all domain documents?"))return;await dClr("kb");kbIdx=null;kbList();msg("","All domain documents removed.")};
+}
+addEventListener("load",kbWire);
+
 const LLM_SYS=`You are a senior support engineer assisting with ticket triage. You get a NEW ticket and CANDIDATE resolved tickets retrieved by a matching pipeline, with a match tier (Strong, Possible, None).
-Rules: use only the supplied text; never invent ticket keys, error codes, logs or fixes. Cite candidate keys you rely on. If the tier is None or the candidates do not support a conclusion, set insufficient_evidence to true and give only generic next steps and questions for the reporter. Say clearly what differs between the new ticket and the candidate before recommending its fix.
-Reply with JSON only, no markdown: {"fix_applies":"yes|partly|no|unknown","root_cause_hypothesis":"","evidence":[""],"differences":[""],"steps":[""],"questions_for_reporter":[""],"cited":[""],"insufficient_evidence":false}`;
-function llmPrompt(a,t){
+Rules: use only the supplied text; never invent ticket keys, error codes, logs or fixes. Cite candidate keys you rely on. If the tier is None or the candidates do not support a conclusion, and domain_knowledge does not either, set insufficient_evidence to true and give only generic next steps and questions for the reporter. Say clearly what differs between the new ticket and the candidate before recommending its fix.
+domain_knowledge holds excerpts from the team's own documentation (source = document and page). Use them to explain causes and give resolution steps, quote the source in evidence, and never list them in cited. Reply with JSON only, no markdown: {"fix_applies":"yes|partly|no|unknown","root_cause_hypothesis":"","evidence":[""],"differences":[""],"steps":[""],"questions_for_reporter":[""],"cited":[""],"insufficient_evidence":false}`;
+function llmPrompt(a,t,kb){
   const keys=[...new Set([...a.related_tickets.map(x=>x.key),...a.text_matches.map(x=>x.key)])].slice(0,5);
   const cands=keys.map(k=>H.find(r=>r.key===k)).filter(Boolean).map(r=>({key:r.key,summary:maskPII(r.summary),description:maskPII(oneLine(r.description).slice(0,800)),rootCause:maskPII(r.rootCause),resolution:maskPII(r.resolution)}));
   const att=(t.attachments||[]).filter(x=>x.readable).map(x=>x.name+": "+maskPII(x.text).slice(0,1500)).join("\n").slice(0,3000);
-  return {keys,body:JSON.stringify({match_tier:a.match_tier,score:a.confidence_score,parsed:a.parsed,new_ticket:{summary:maskPII(t.summary),description:maskPII(oneLine(t.description).slice(0,2000)),component:t.component,attachments:att},candidates:cands})};
+  return {keys,body:JSON.stringify({match_tier:a.match_tier,score:a.confidence_score,parsed:a.parsed,new_ticket:{summary:maskPII(t.summary),description:maskPII(oneLine(t.description).slice(0,2000)),component:t.component,attachments:att},candidates:cands,domain_knowledge:(kb||[]).map(h=>({source:h.doc+" p."+h.page+(h.head?" - "+h.head:""),text:maskPII(h.text).slice(0,900)}))})};
 }
 async function llmCall(a,t,sig){
   const c=llmCfg();if(!c.key)throw new Error("Open LLM settings and enter an API key first.");
-  const {keys,body}=llmPrompt(a,t);
+  const kb=a.kb||await kbSearch(kbQuery(a,t),3).catch(()=>[]);const {keys,body}=llmPrompt(a,t,kb);
   const txt=(await geminiCall({system:LLM_SYS,msgs:[{role:"user",content:body}],maxTokens:2048,json:true,sig})).replace(/```json|```/g,"").trim();
   let j;try{j=JSON.parse(txt.slice(txt.indexOf("{"),txt.lastIndexOf("}")+1))}catch(e){throw new Error("The LLM did not return valid JSON.")}
   const arr=v=>Array.isArray(v)?v.map(String):[];
   const out={fix_applies:String(j.fix_applies||"unknown"),root:String(j.root_cause_hypothesis||""),evidence:arr(j.evidence),differences:arr(j.differences),steps:arr(j.steps),questions:arr(j.questions_for_reporter),
-    cited:arr(j.cited).filter(k=>keys.includes(k)),dropped:arr(j.cited).filter(k=>!keys.includes(k)),insufficient:!!j.insufficient_evidence||a.match_tier==="None"};
+    cited:arr(j.cited).filter(k=>keys.includes(k)),dropped:arr(j.cited).filter(k=>!keys.includes(k)),insufficient:!!j.insufficient_evidence||(a.match_tier==="None"&&!kb.length)};
   if(out.insufficient)out.fix_applies="unknown";
   return out;
 }
@@ -818,7 +886,7 @@ function typeHtml(el,html){
     },18);
   });
 }
-function llmWire(a,t){
+function llmWire(a,t){kbShow(a,t);
   const c=llmCfg();$("llkey").value=c.key||"";
   const ic=document.querySelector('link[rel="icon"]'),fi=$("llface");if(ic)fi.src=ic.href;else fi.hidden=true;
   $("llkey").onchange=()=>{try{localStorage.setItem(LLMK,JSON.stringify({key:$("llkey").value.trim()}))}catch(e){toast("Could not store settings","err")}};
@@ -882,6 +950,7 @@ function render(a,t){
   <h3>AI reasoning (LLM)</h3><div id="llm"><details id="llmcfg"><summary>LLM settings (stored only in this browser)</summary>
   <label for="llkey">Gemini API key</label><input id="llkey" type="password" autocomplete="off">
   <div class="note" style="margin-top:8px">Sent to the LLM: the ticket text and the top matched tickets, with phone numbers, emails and IPs masked. Nothing is sent until you click the button.</div></details>
+  <div id="kbres"></div>
   <div class="bar"><button class="b askbtn" id="llmgo" type="button" aria-label="Ask the L3 agent"><span>Ask</span><img id="llface" alt="" width="22" height="22"></button></div><div id="llmout" role="status" aria-live="polite"></div></div>
   <div class="bar"><button class="b" id="addv">Send to validation</button><button class="b s" id="addh">Save to Previous Jira DB…</button><button class="b s" id="cj">Copy JSON</button><button class="b s" id="dj">Download JSON</button></div></div>`;
   $("cj").onclick=()=>navigator.clipboard&&navigator.clipboard.writeText(JSON.stringify(a,null,2));
@@ -1114,20 +1183,20 @@ function textItemsToLines(items,out){
 async function readPdf(file,onStep){
   const lib=await getPdfLib();
   const pdf=await lib.getDocument({data:new Uint8Array(await file.arrayBuffer())}).promise,n=pdf.numPages;
-  let lines=[];
-  for(let p=1;p<=n;p++){onStep&&onStep(`Reading text, page ${p} of ${n}`,p-1,n);const tc=await (await pdf.getPage(p)).getTextContent();textItemsToLines(tc.items,lines)}
-  if(lines.join("").length>=150)return {lines,method:"text",pages:n};
-  lines=[];onStep&&onStep("No text layer found, starting OCR (the first run loads the OCR engine)",0,n);
+  let lines=[],starts=[];
+  for(let p=1;p<=n;p++){onStep&&onStep(`Reading text, page ${p} of ${n}`,p-1,n);const tc=await (await pdf.getPage(p)).getTextContent();starts.push(lines.length);textItemsToLines(tc.items,lines)}
+  if(lines.join("").length>=150)return {lines,method:"text",pages:n,starts};
+  lines=[];starts=[];onStep&&onStep("No text layer found, starting OCR (the first run loads the OCR engine)",0,n);
   const w=await getOcr();
   for(let p=1;p<=n;p++){
     onStep&&onStep(`OCR page ${p} of ${n}`,p-1,n);
     const page=await pdf.getPage(p),vp=page.getViewport({scale:2.5}),cv=document.createElement("canvas");
     cv.width=Math.ceil(vp.width);cv.height=Math.ceil(vp.height);
     await page.render({canvasContext:cv.getContext("2d"),viewport:vp}).promise;
-    const r=await w.recognize(cv);lines.push(...r.data.text.split("\n").map(x=>x.trim()).filter(Boolean));
+    const r=await w.recognize(cv);starts.push(lines.length);lines.push(...r.data.text.split("\n").map(x=>x.trim()).filter(Boolean));
   }
   onStep&&onStep("Parsing ticket",n,n);
-  return {lines,method:"ocr",pages:n};
+  return {lines,method:"ocr",pages:n,starts};
 }
 
 /* ---------- Jira issue (printed HTML/PDF) parser ---------- */
@@ -1463,7 +1532,7 @@ const isOwnerQ=q=>OWNER_RE0.test(q)&&!/\b[A-Z][A-Z0-9]+-\d+\b/.test(q);
 const INCIDENT_RE=/\b(?:op|get|set|create|update|delete|query|check|activate|send)[A-Z][A-Za-z]+|\bORA-\d{4,5}|\b[45]0[0-9]\b|\b(?:fail|fails|failed|failing|failure|stuck|timeout|timed out|exception|crash\w*|not working|unable|cannot|can't|duplicate|deadlock)\b/i;
 const ASK_RE=/^\s*(how|what|where|which|why|who|when|can|could|does|do|is|are|explain|tell|show|define|describe|help)\b/i;
 const isManualQ=(q,mm)=>{const s=mm[0].s;if(INCIDENT_RE.test(q)&&s<18)return false;return s>=18||(s>=7&&ASK_RE.test(q))};
-const CH_SYS=`You are L3 Investigator, an assistant inside a support engineer's ticket investigation tool. The tool was made and is owned by Ranga Lankathilaka, Tech Lead - Software Engineering, AI & Cloud; say so if asked. Answer briefly and practically. For questions about how to use the tool, answer only from the MANUAL EXCERPTS and say so if the manual does not cover it. For incident questions, treat the supplied candidate tickets as the only evidence about past incidents and cite their keys. If neither supports an answer, say so and give generic next steps or questions to ask. Never invent ticket keys, logs, features or fixes, and say when a past fix may not apply. If a question is unrelated to this tool or to support tickets, politely say you can only help with those.`;
+const CH_SYS=`You are L3 Investigator, an assistant inside a support engineer's ticket investigation tool. The tool was made and is owned by Ranga Lankathilaka, Tech Lead - Software Engineering, AI & Cloud; say so if asked. Answer briefly and practically. DOMAIN DOCS, when supplied, are excerpts from the team's own documentation: use them and name the document and page. For questions about how to use the tool, answer only from the MANUAL EXCERPTS and say so if the manual does not cover it. For incident questions, treat the supplied candidate tickets as the only evidence about past incidents and cite their keys. If neither supports an answer, say so and give generic next steps or questions to ask. Never invent ticket keys, logs, features or fixes, and say when a past fix may not apply. If a question is unrelated to this tool or to support tickets, politely say you can only help with those.`;
 (function(){
   const log=$("chlog"),inp=$("chin"),send=$("chsend"),panel=$("chat"),btn=$("agbtn");
   const still=!!(window.matchMedia&&matchMedia("(prefers-reduced-motion: reduce)").matches);
@@ -1501,9 +1570,9 @@ const CH_SYS=`You are L3 Investigator, an assistant inside a support engineer's 
     :"I couldn't find a close match in your Previous Jira DB. Try adding the exact error text, the operation name or a few log lines."+(H.length?"":" (The database is empty, so save some past tickets first.)");
   const manAnswer=mm=>{const a=mm[0],b=mm[1];let t=`From the user manual: ${a.m.title}\n${a.m.text}`;if(b&&b.s>=7&&b.s>=a.s*.7)t+=`\n\nAlso see: ${b.m.title}\n${b.m.text}`;return t};
   async function ask(q,recs,a,ex){
-    const c=llmCfg();
+    const c=llmCfg(),kb=await kbSearch(q,3).catch(()=>[]);
     const ctx=JSON.stringify({rules_engine_tier:a.match_tier,candidates:recs.map(r=>({key:r.key,summary:maskPII(r.summary),rootCause:maskPII(r.rootCause),resolution:maskPII(r.resolution),description:maskPII(oneLine(r.description).slice(0,500))}))});
-    const msgs=[...hist.slice(-6),{role:"user",content:(ex.length?"MANUAL EXCERPTS:\n"+JSON.stringify(ex)+"\n\n":"")+"Candidate tickets from the Previous Jira DB:\n"+ctx+"\n\nQuestion:\n"+maskPII(q)}];
+    const msgs=[...hist.slice(-6),{role:"user",content:(kb.length?"DOMAIN DOCS:\n"+JSON.stringify(kb.map(h=>({source:h.doc+" p."+h.page,text:maskPII(h.text).slice(0,900)})))+"\n\n":"")+(ex.length?"MANUAL EXCERPTS:\n"+JSON.stringify(ex)+"\n\n":"")+"Candidate tickets from the Previous Jira DB:\n"+ctx+"\n\nQuestion:\n"+maskPII(q)}];
     const txt=await geminiCall({system:CH_SYS,msgs,maxTokens:1024});
     hist.push({role:"user",content:maskPII(q)},{role:"assistant",content:txt});
     return txt;
@@ -1517,10 +1586,11 @@ const CH_SYS=`You are L3 Investigator, an assistant inside a support engineer's 
       else{
         const mm=manScore(q),man=isManualQ(q,mm);let a={},recs=[];
         if(!man)try{({a,recs}=find(q))}catch(e){}
+        const kbo=man?"":await kbSearch(q,2).then(k=>k.length?"\n\nFrom your domain documents:\n"+k.map(h=>h.doc+" (page "+h.page+(h.head?", "+h.head:"")+")\n"+h.text.slice(0,600)).join("\n\n"):"").catch(()=>"");
         if(llmCfg().key){
           try{out=await ask(q,recs,a,man?mm.filter(x=>x.s>=Math.max(7,mm[0].s*.5)).slice(0,3).map(x=>({title:x.m.title,text:x.m.text})):[])}
-          catch(e){out="The AI request failed ("+e.message+").\n\n"+(man?manAnswer(mm):offline(a,recs))}
-        }else out=man?manAnswer(mm):offline(a,recs)+"\n\nTip: add an API key in the gear menu for AI answers.";
+          catch(e){out="The AI request failed ("+e.message+").\n\n"+(man?manAnswer(mm):offline(a,recs)+kbo)}
+        }else out=man?manAnswer(mm):offline(a,recs)+kbo+"\n\nTip: add an API key in the gear menu for AI answers.";
       }
     }catch(e){out="Sorry, something went wrong ("+e.message+")."}
     busy=false;send.disabled=false;w.textContent="";await typeMsg(w,out);inp.focus();
