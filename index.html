@@ -1084,8 +1084,8 @@ const prog=(pct,label)=>{$("sprog").hidden=false;$("sbar").value=pct;$("slab").t
 const smsg=(kind,html)=>{$("smsg").innerHTML=`<div class="note ${kind}">${html}</div>`};
 const busy=on=>["bk","rgo","reb","wipe","rfile"].forEach(id=>{$(id).disabled=on||(id==="rgo"&&!pend)});
 async function stats(){
-  const h=await dAll("history"),r=await dAll("reviews"),kb=Math.round(new Blob([JSON.stringify({h,r})]).size/1024),lb=lsGet("tia_lastBackup");
-  $("sstat").innerHTML=`<b>${h.length}</b> previous tickets, <b>${r.length}</b> reviews, about ${kb} KB. Storage: ${db?"IndexedDB":"memory only (IndexedDB unavailable)"}. Last backup from this browser: ${lb?new Date(lb).toLocaleString():"never"}.`;
+  const h=await dAll("history"),r=await dAll("reviews"),kc=await dAll("kb"),kb=Math.round(new Blob([JSON.stringify({h,r,kc})]).size/1024),lb=lsGet("tia_lastBackup");
+  $("sstat").innerHTML=`<b>${h.length}</b> previous tickets, <b>${r.length}</b> reviews, <b>${new Set(kc.map(x=>x.doc)).size}</b> domain documents, about ${kb} KB. Storage: ${db?"IndexedDB":"memory only (IndexedDB unavailable)"}. Last backup from this browser: ${lb?new Date(lb).toLocaleString():"never"}.`;
 }
 $("bk").onclick=async()=>{
   $("smsg").innerHTML="";busy(true);
@@ -1093,15 +1093,15 @@ $("bk").onclick=async()=>{
     prog(5,"Reading tickets");await tick();
     const history=(await dAll("history")).map(slim);
     prog(35,"Reading reviews");await tick();
-    const reviews=await dAll("reviews"),model=await dAll("model");
+    const reviews=await dAll("reviews"),model=await dAll("model"),kbd=await dAll("kb");
     prog(60,"Building backup file");await tick();
     const at=new Date().toISOString(),name=`ticket-agent-backup-${at.slice(0,10)}.json`;
-    const json=JSON.stringify({app:BK_APP,version:1,exportedAt:at,history,reviews,model});
+    const json=JSON.stringify({app:BK_APP,version:2,exportedAt:at,history,reviews,model,kb:kbd});
     prog(85,"Starting download");await tick();
     dl(name,json,"application/json");
     try{localStorage.setItem("tia_lastBackup",at)}catch(e){}
     prog(100,"Backup completed");
-    smsg("ok",`<b>Backup completed.</b> ${history.length} tickets and ${reviews.length} reviews (${Math.round(json.length/1024)} KB) saved as <code>${esc(name)}</code>. Check your downloads folder.`);
+    smsg("ok",`<b>Backup completed.</b> ${history.length} tickets, ${reviews.length} reviews and ${new Set(kbd.map(x=>x.doc)).size} domain documents (${Math.round(json.length/1024)} KB) saved as <code>${esc(name)}</code>. Check your downloads folder.`);
   }catch(err){$("sprog").hidden=true;smsg("err",`<b>Backup failed:</b> ${esc(err.message)}`)}
   busy(false);stats();
 };
@@ -1110,26 +1110,28 @@ $("rfile").onchange=async e=>{
   const f=e.target.files[0];if(!f)return;$("smsg").innerHTML="";$("sprog").hidden=true;
   try{const j=JSON.parse(await f.text());
     if(j.app!==BK_APP||!Array.isArray(j.history))throw new Error("this is not a backup file from this page");
-    pend={history:j.history.filter(x=>x&&x.key),reviews:(j.reviews||[]).filter(x=>x&&x.key)};
-    $("rinfo").innerHTML=`<div class="note">${esc(f.name)}: ${pend.history.length} tickets, ${pend.reviews.length} reviews${j.exportedAt?", exported "+esc(new Date(j.exportedAt).toLocaleString()):""}. Choose a mode and click Restore.</div>`;$("rgo").disabled=false;
+    pend={history:j.history.filter(x=>x&&x.key),reviews:(j.reviews||[]).filter(x=>x&&x.key),kb:Array.isArray(j.kb)?j.kb.filter(x=>x&&x.key&&x.doc&&x.text):null};
+    $("rinfo").innerHTML=`<div class="note">${esc(f.name)}: ${pend.history.length} tickets, ${pend.reviews.length} reviews${pend.kb?", "+new Set(pend.kb.map(x=>x.doc)).size+" domain documents":""}${j.exportedAt?", exported "+esc(new Date(j.exportedAt).toLocaleString()):""}. Choose a mode and click Restore.</div>`;$("rgo").disabled=false;
   }catch(err){pend=null;$("rgo").disabled=true;$("rinfo").innerHTML=`<div class="note err">Cannot restore: ${esc(err.message)}.</div>`}
   e.target.value="";
 };
 $("rgo").onclick=async()=>{
   if(!pend)return;const replace=document.querySelector("input[name=rmode]:checked").value==="replace";
-  if(replace&&!confirm("Replace deletes all current tickets and reviews before restoring. Continue?"))return;
+  if(replace&&!confirm("Replace deletes all current tickets, reviews and (if the backup contains them) domain documents before restoring. Continue?"))return;
   $("smsg").innerHTML="";busy(true);
-  const data=pend,n=data.history.length,m=data.reviews.length,total=n+m||1;let done=0;
+  const data=pend,n=data.history.length,m=data.reviews.length,kn=data.kb?data.kb.length:0,total=n+m+kn||1;let done=0;
   try{
-    if(replace){prog(2,"Clearing current data");await tick();await dClr("history");await dClr("reviews");await dClr("model");ML.fb=[]}
+    if(replace){prog(2,"Clearing current data");await tick();await dClr("history");await dClr("reviews");await dClr("model");if(data.kb)await dClr("kb");ML.fb=[]}
     for(const m of (data.model||[]))await dPut("model",m);ML.fb=(await dAll("model")).filter(r=>String(r.key).startsWith("fb:"));
     for(const r of data.history){await saveH(r);done++;if(done%5===0||done===n){prog(5+done/total*90,`Restoring tickets ${done} of ${n}`);await tick()}}
     for(const r of data.reviews){await dPut("reviews",r);done++;if(done%5===0||done===total){prog(5+done/total*90,`Restoring reviews ${done-n} of ${m}`);await tick()}}
+    for(const r of (data.kb||[])){await dPut("kb",r);done++;if(done%20===0||done===total){prog(5+done/total*90,`Restoring domain documents ${done-n-m} of ${kn}`);await tick()}}
+    kbIdx=null;await kbList();
     prog(97,"Verifying");await tick();
     await loadH();await loadR();
     prog(100,"Restore completed");
     pend=null;$("rinfo").innerHTML="";
-    smsg("ok",`<b>Restore completed.</b> ${n} tickets and ${m} reviews ${replace?"restored (replaced previous data)":"merged"}. The Previous Jira DB now holds ${H.length} tickets and ${R.length} reviews.`);
+    smsg("ok",`<b>Restore completed.</b> ${n} tickets, ${m} reviews and ${data.kb?new Set(data.kb.map(x=>x.doc)).size:0} domain documents ${replace?"restored (replaced previous data)":"merged"}. The Previous Jira DB now holds ${H.length} tickets and ${R.length} reviews.`);
   }catch(err){$("sprog").hidden=true;smsg("err",`<b>Restore failed after ${done} of ${total} records:</b> ${esc(err.message)}. Data already written was kept; run the restore again to finish.`)}
   busy(false);stats();
 };
