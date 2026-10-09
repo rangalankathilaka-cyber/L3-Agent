@@ -774,7 +774,7 @@ async function geminiCall({system,msgs,maxTokens=1200,json=false,sig}){
 }
 const maskPII=s=>String(s||"").replace(/[\w.+-]+@[\w-]+\.[\w.]+/g,"<EMAIL>").replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g,"<IP>").replace(/\+?\b\d{9,15}\b/g,"<NUMBER>");
 /* ---------- Domain knowledge base (PDF/TXT -> chunks in IndexedDB store "kb" -> BM25 search) ---------- */
-const kbTok=s=>{const o=[];String(s||"").replace(/[A-Za-z][A-Za-z0-9_]*|\d{2,}/g,w=>{o.push(w.toLowerCase());const p=w.replace(/([a-z])([A-Z])/g,"$1 $2").split(/[_\s]+/).map(x=>x.toLowerCase()).filter(x=>x.length>2);if(p.length>1)o.push(...p)});return o.filter(w=>w.length>2&&!STOP.has(w))};
+const kbTok=s=>{const o=[];String(s||"").replace(/[A-Za-z][A-Za-z0-9_]*|\d{2,}/g,w=>{o.push(w.toLowerCase());const p=w.replace(/([a-z])([A-Z])/g,"$1 $2").split(/[_\s]+/).map(x=>x.toLowerCase()).filter(x=>x.length>2);if(p.length>1)o.push(...p)});return o.filter(w=>w.length>2&&!STOP.has(w)).map(w=>w.length>4&&/[^s]s$/.test(w)?w.slice(0,-1):w)};
 /* Layout-agnostic: lines in -> chunks out. A short line without a full stop that looks like a title or ends with ":" starts a new section. */
 function kbChunk(lines,starts){
   const out=[];let head="",buf=[],len=0,pg=1,pi=0,bpg=1;
@@ -793,11 +793,17 @@ async function kbLoad(force){
   const df=new Map();let tl=0;c.forEach(r=>{tl+=r.len;r.tf.forEach((_,w)=>df.set(w,(df.get(w)||0)+1))});
   return kbIdx={c,df,avg:tl/Math.max(1,c.length)};
 }
+const KB_NAME_SKIP=new Set(["documentation","document","docs","doc","pdf","final","draft","version","copy","new"]);
 async function kbSearch(q,n){
   const ix=await kbLoad();if(!ix.c.length)return[];
   const qt=[...new Set(kbTok(q))],N=ix.c.length;
-  const sc=ix.c.map(r=>{let s=0,m=0;qt.forEach(w=>{const f=r.tf.get(w);if(!f)return;m++;const d=ix.df.get(w);s+=Math.log(1+(N-d+.5)/(d+.5))*f*2.2/(f+1.2*(.25+.75*r.len/ix.avg))});return {r,s,m}})
-    .filter(z=>z.m>=2&&z.s>=4).sort((a,b)=>b.s-a.s);
+  /* 1) which documents have a name that matches the question (e.g. "external calls" -> "External Services Integration.pdf") */
+  const nm=new Map(),cnt=new Map();
+  ix.c.forEach(r=>{const d=r.x.doc;if(!nm.has(d)){const t=new Set(kbTok(d.replace(/\.[a-z0-9]+$/i,"")).filter(w=>!KB_NAME_SKIP.has(w)));nm.set(d,t);t.forEach(w=>cnt.set(w,(cnt.get(w)||0)+1))}});
+  const bonus=new Map();nm.forEach((t,d)=>{let b=0;qt.forEach(w=>{if(t.has(w))b+=6/cnt.get(w)});if(b)bonus.set(d,b)});
+  /* 2) then score the content, with a boost for chunks of the matching documents */
+  const sc=ix.c.map(r=>{let s=0,m=0;qt.forEach(w=>{const f=r.tf.get(w);if(!f)return;m++;const d=ix.df.get(w);s+=Math.log(1+(N-d+.5)/(d+.5))*f*2.2/(f+1.2*(.25+.75*r.len/ix.avg))});const bo=bonus.get(r.x.doc)||0;return {r,s:s+bo,m,bo}})
+    .filter(z=>(z.m>=2&&z.s>=4)||(z.bo>0&&z.s>=3)).sort((a,b)=>b.s-a.s);
   if(!sc.length)return[];
   return sc.filter(z=>z.s>=sc[0].s*.5).slice(0,n||3).map(z=>({doc:z.r.x.doc,page:z.r.x.page,head:z.r.x.head,text:z.r.x.text,score:z.s}));
 }
@@ -1534,7 +1540,7 @@ const isOwnerQ=q=>OWNER_RE0.test(q)&&!/\b[A-Z][A-Z0-9]+-\d+\b/.test(q);
 const INCIDENT_RE=/\b(?:op|get|set|create|update|delete|query|check|activate|send)[A-Z][A-Za-z]+|\bORA-\d{4,5}|\b[45]0[0-9]\b|\b(?:fail|fails|failed|failing|failure|stuck|timeout|timed out|exception|crash\w*|not working|unable|cannot|can't|duplicate|deadlock)\b/i;
 const ASK_RE=/^\s*(how|what|where|which|why|who|when|can|could|does|do|is|are|explain|tell|show|define|describe|help)\b/i;
 const isManualQ=(q,mm)=>{const s=mm[0].s;if(INCIDENT_RE.test(q)&&s<18)return false;return s>=18||(s>=7&&ASK_RE.test(q))};
-const CH_SYS=`You are L3 Investigator, an assistant inside a support engineer's ticket investigation tool. The tool was made and is owned by Ranga Lankathilaka, Tech Lead - Software Engineering, AI & Cloud; say so if asked. Answer briefly and practically. DOMAIN DOCS, when supplied, are the team's own documentation. Answer directly and confidently from them in plain sentences, merging the points into one clear answer. Never mention document names, file names, page numbers or that you were given documents. Do not use markdown (no asterisks, bold or headings); if a list helps, use short lines starting with a hyphen. For questions about how to use the tool, answer only from the MANUAL EXCERPTS and say so if the manual does not cover it. For incident questions, treat the supplied candidate tickets as the only evidence about past incidents and cite their keys. If neither supports an answer, say so and give generic next steps or questions to ask. Never invent ticket keys, logs, features or fixes, and say when a past fix may not apply. If a question is unrelated to this tool or to support tickets, politely say you can only help with those.`;
+const CH_SYS=`You are L3 Investigator, an assistant inside a support engineer's ticket investigation tool. The tool was made and is owned by Ranga Lankathilaka, Tech Lead - Software Engineering, AI & Cloud; say so if asked. Answer briefly and practically. DOMAIN DOCS, when supplied, are the team's own documentation. Answer directly and confidently from them in plain sentences, merging the points into one clear answer. Never mention document names, file names, page numbers, sources or that you were given documents. Do not use markdown (no asterisks, bold or headings); if a list helps, use short lines starting with a hyphen. For questions about how to use the tool, answer only from the MANUAL EXCERPTS and say so if the manual does not cover it. For incident questions, treat the supplied candidate tickets as the only evidence about past incidents and cite their keys. If neither supports an answer, say so and give generic next steps or questions to ask. Never invent ticket keys, logs, features or fixes, and say when a past fix may not apply. If a question is unrelated to this tool or to support tickets, politely say you can only help with those.`;
 (function(){
   const log=$("chlog"),inp=$("chin"),send=$("chsend"),panel=$("chat"),btn=$("agbtn");
   const still=!!(window.matchMedia&&matchMedia("(prefers-reduced-motion: reduce)").matches);
