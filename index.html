@@ -1532,7 +1532,7 @@ const isOwnerQ=q=>OWNER_RE0.test(q)&&!/\b[A-Z][A-Z0-9]+-\d+\b/.test(q);
 const INCIDENT_RE=/\b(?:op|get|set|create|update|delete|query|check|activate|send)[A-Z][A-Za-z]+|\bORA-\d{4,5}|\b[45]0[0-9]\b|\b(?:fail|fails|failed|failing|failure|stuck|timeout|timed out|exception|crash\w*|not working|unable|cannot|can't|duplicate|deadlock)\b/i;
 const ASK_RE=/^\s*(how|what|where|which|why|who|when|can|could|does|do|is|are|explain|tell|show|define|describe|help)\b/i;
 const isManualQ=(q,mm)=>{const s=mm[0].s;if(INCIDENT_RE.test(q)&&s<18)return false;return s>=18||(s>=7&&ASK_RE.test(q))};
-const CH_SYS=`You are L3 Investigator, an assistant inside a support engineer's ticket investigation tool. The tool was made and is owned by Ranga Lankathilaka, Tech Lead - Software Engineering, AI & Cloud; say so if asked. Answer briefly and practically. DOMAIN DOCS, when supplied, are excerpts from the team's own documentation: use them and name the document and page. For questions about how to use the tool, answer only from the MANUAL EXCERPTS and say so if the manual does not cover it. For incident questions, treat the supplied candidate tickets as the only evidence about past incidents and cite their keys. If neither supports an answer, say so and give generic next steps or questions to ask. Never invent ticket keys, logs, features or fixes, and say when a past fix may not apply. If a question is unrelated to this tool or to support tickets, politely say you can only help with those.`;
+const CH_SYS=`You are L3 Investigator, an assistant inside a support engineer's ticket investigation tool. The tool was made and is owned by Ranga Lankathilaka, Tech Lead - Software Engineering, AI & Cloud; say so if asked. Answer briefly and practically. DOMAIN DOCS, when supplied, are the team's own documentation. Answer directly and confidently from them in plain sentences, merging the points into one clear answer. Never mention document names, file names, page numbers or that you were given documents. Do not use markdown (no asterisks, bold or headings); if a list helps, use short lines starting with a hyphen. For questions about how to use the tool, answer only from the MANUAL EXCERPTS and say so if the manual does not cover it. For incident questions, treat the supplied candidate tickets as the only evidence about past incidents and cite their keys. If neither supports an answer, say so and give generic next steps or questions to ask. Never invent ticket keys, logs, features or fixes, and say when a past fix may not apply. If a question is unrelated to this tool or to support tickets, politely say you can only help with those.`;
 (function(){
   const log=$("chlog"),inp=$("chin"),send=$("chsend"),panel=$("chat"),btn=$("agbtn");
   const still=!!(window.matchMedia&&matchMedia("(prefers-reduced-motion: reduce)").matches);
@@ -1572,7 +1572,7 @@ const CH_SYS=`You are L3 Investigator, an assistant inside a support engineer's 
   async function ask(q,recs,a,ex){
     const c=llmCfg(),kb=await kbSearch(q,3).catch(()=>[]);
     const ctx=JSON.stringify({rules_engine_tier:a.match_tier,candidates:recs.map(r=>({key:r.key,summary:maskPII(r.summary),rootCause:maskPII(r.rootCause),resolution:maskPII(r.resolution),description:maskPII(oneLine(r.description).slice(0,500))}))});
-    const msgs=[...hist.slice(-6),{role:"user",content:(kb.length?"DOMAIN DOCS:\n"+JSON.stringify(kb.map(h=>({source:h.doc+" p."+h.page,text:maskPII(h.text).slice(0,900)})))+"\n\n":"")+(ex.length?"MANUAL EXCERPTS:\n"+JSON.stringify(ex)+"\n\n":"")+"Candidate tickets from the Previous Jira DB:\n"+ctx+"\n\nQuestion:\n"+maskPII(q)}];
+    const msgs=[...hist.slice(-6),{role:"user",content:(kb.length?"DOMAIN DOCS:\n"+JSON.stringify(kb.map(h=>maskPII(h.text).slice(0,900)))+"\n\n":"")+(ex.length?"MANUAL EXCERPTS:\n"+JSON.stringify(ex)+"\n\n":"")+"Candidate tickets from the Previous Jira DB:\n"+ctx+"\n\nQuestion:\n"+maskPII(q)}];
     const txt=await geminiCall({system:CH_SYS,msgs,maxTokens:1024});
     hist.push({role:"user",content:maskPII(q)},{role:"assistant",content:txt});
     return txt;
@@ -1586,7 +1586,7 @@ const CH_SYS=`You are L3 Investigator, an assistant inside a support engineer's 
       else{
         const mm=manScore(q),man=isManualQ(q,mm);let a={},recs=[];
         if(!man)try{({a,recs}=find(q))}catch(e){}
-        const kbo=man?"":await kbSearch(q,2).then(k=>k.length?"\n\nFrom your domain documents:\n"+k.map(h=>h.doc+" (page "+h.page+(h.head?", "+h.head:"")+")\n"+h.text.slice(0,600)).join("\n\n"):"").catch(()=>"");
+        const kbo=man?"":await kbSearch(q,2).then(k=>k.length?"\n\n"+k.map(h=>(h.head?h.head+"\n":"")+h.text.slice(0,600)).join("\n\n"):"").catch(()=>"");
         if(llmCfg().key){
           try{out=await ask(q,recs,a,man?mm.filter(x=>x.s>=Math.max(7,mm[0].s*.5)).slice(0,3).map(x=>({title:x.m.title,text:x.m.text})):[])}
           catch(e){out="The AI request failed ("+e.message+").\n\n"+(man?manAnswer(mm):offline(a,recs)+kbo)}
